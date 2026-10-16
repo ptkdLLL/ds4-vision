@@ -1,9 +1,21 @@
-> **Fork notice (ds4-vision)**: this fork adds a **distributed vision (multimodal) path**
-> on top of upstream DwarfStar 4, designed so that image-bearing sessions keep byte-stable
-> prompt caches (deterministic image markers + byte-level prefix walk + multimodal disk
-> snapshots), and ships a companion pi extension package (`pi-extensions/`) implementing the
-> client half of the cache contract. If you are here for the multimodal / prompt-caching work,
-> read **[VISION_FORK.md](VISION_FORK.md)** first. Everything else is upstream's.
+# ds4-vision
+
+> **Fork notice**: this is a fork of [DwarfStar 4](https://github.com/antirez/ds4) ("ds4.c",
+> MIT). The engine, server and agent are upstream's; this fork adds a **distributed vision
+> (multimodal) path built around one hard requirement: prompt-cache reuse must survive
+> images.**
+>
+> **What's added**: a vision encoder on the coordinator with synthetic image tokens routed
+> through the layer-sliced pipeline (`0:23` / `24:output`); **deterministic 36-byte image
+> markers** as stable image identity across turns; a **byte-level prefix walk** with
+> structural (offset) and fingerprint binding, fail-closed on any ambiguity; **multimodal
+> disk snapshots** with a two-way-validated vision trailer; and a **pi extension package**
+> (`pi-extensions/`) implementing the client half of the cache contract — consume-and-mirror
+> image replacement (`image-window`) and deterministic WebP->PNG pre-read conversion
+> (`webp-to-png`).
+>
+> **Start here**: **[VISION_FORK.md](VISION_FORK.md)** for the full story, design notes and
+> limitations. Everything below is upstream's README.
 
 <p align="center">
   <img src="logo.svg" alt="DwarfStar logo" width="220">
