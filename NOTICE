@@ -1,0 +1,13 @@
+ds4-vision — fork notice
+
+This repository is a fork of DwarfStar 4 ("ds4.c"):
+    https://github.com/antirez/ds4
+
+Upstream is distributed under the MIT License (see LICENSE; copyright "The ds4.c authors",
+and "The ggml authors" for lineage pieces). Fork additions — the distributed vision path,
+deterministic image markers, prefix-walk cache reuse, launcher scripts and the
+pi-extensions/ package — are provided under the same MIT License.
+
+Model weights are NOT distributed with this repository. "DeepSeek V4 Flash" and the
+vision-encoder GGUF files are obtained separately; see download_model.sh and upstream
+documentation.
