@@ -414,6 +414,12 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     kv_le_put64(h + 40, payload_bytes);
 }
 
+/* routed-expert quantizations whose checkpoints the store keys on */
+bool ds4_kvstore_quant_bits_supported(int quant_bits) {
+    return quant_bits == 2 || quant_bits == 4 || quant_bits == 5 ||
+           quant_bits == 6 || quant_bits == 8;
+}
+
 bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes) {
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
@@ -436,7 +442,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
     if (fread(tb, 1, sizeof(tb), fp) != sizeof(tb)) return false;
     *text_bytes = ds4_kvstore_le_get32(tb);
     e->text_bytes = *text_bytes;
-    return e->tokens != 0 && (e->quant_bits == 2 || e->quant_bits == 4);
+    return e->tokens != 0 && ds4_kvstore_quant_bits_supported(e->quant_bits);
 }
 
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
@@ -940,7 +946,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     ds4_kvstore_tokens_copy_prefix(&store_tokens, tokens, store_len);
 
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) {
+    if (!ds4_kvstore_quant_bits_supported(quant_bits)) {
         ds4_tokens_free(&store_tokens);
         return false;
     }
@@ -948,10 +954,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
 
     char save_err[160] = {0};
     const ds4_tokens *live_tokens = ds4_session_tokens(session);
-    /* fork: prefix stores (evict at the prompt boundary) are allowed; the
-     * live session may be longer because it also holds generated tokens,
-     * which the next rerender never reproduces. */
     if (!live_tokens ||
+        live_tokens->len != store_tokens.len ||
         !ds4_tokens_starts_with(live_tokens, &store_tokens))
     {
         kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
@@ -1190,8 +1194,7 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
 }
 
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size,
-                                 uint8_t require_ext_flags) {
+                                 int model_id, int quant_bits, int ctx_size) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
@@ -1203,16 +1206,6 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->model_id != (uint8_t)model_id) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
-        /* fork: multimodal requests only restore snapshots that carry image
-         * identity (vision trailer). A text-only snapshot has no image bytes
-         * and can cut through an image span in the prefix. */
-        if (require_ext_flags && !(e->ext_flags & require_ext_flags) &&
-            getenv("DS4_KV_DIAG")) {
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv diag candidate skip ext tokens=%d ext=%#04x req=%#04x",
-                    kv_log_name(kc), (int)e->tokens, e->ext_flags, require_ext_flags);
-        }
-        if (require_ext_flags && !(e->ext_flags & require_ext_flags)) continue;
         if (best >= 0) {
             ds4_kvstore_entry *b = &kc->entry[best];
             if (e->text_bytes < b->text_bytes) continue;
@@ -1220,13 +1213,6 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         }
         char sha[41];
         ds4_kvstore_sha1_bytes_hex(prompt_text, (size_t)e->text_bytes, sha);
-        if (getenv("DS4_KV_DIAG")) {
-            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                    "%s: kv diag candidate sha match=%d tokens=%d text=%u",
-                    kv_log_name(kc),
-                    strcmp(sha, e->sha) == 0,
-                    (int)e->tokens, e->text_bytes);
-        }
         if (!strcmp(sha, e->sha)) best = i;
     }
     return best;
@@ -1239,17 +1225,16 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              uint8_t require_ext_flags,
                               bool responses_protocol) {
     if (result) memset(result, 0, sizeof(*result));
     if (effective_prompt) effective_prompt->len = 0;
     if (!kc->enabled || !prompt_text) return 0;
     const int quant_bits = ds4_engine_routed_quant_bits(engine);
-    if (quant_bits != 2 && quant_bits != 4) return 0;
+    if (!ds4_kvstore_quant_bits_supported(quant_bits)) return 0;
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session), require_ext_flags);
+                                           ds4_session_ctx(session));
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];
@@ -1310,25 +1295,7 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     effective_prompt);
             }
             if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
-                if (!hooks->load(hooks->ud, fp, hooks->load_wanted)) {
-                    /* fork: the trailer hook rejected this snapshot (vision
-                     * identity block does not match the request's image set,
-                     * e.g. a new image was appended after the snapshot).  The
-                     * payload has already been restored into the session; drop
-                     * it and report a miss so the caller re-prefills from the
-                     * request instead of continuing over mismatched image
-                     * spans.  The file stays — it remains a valid snapshot for
-                     * the image set it was taken for. */
-                    ds4_session_invalidate(session);
-                    if (effective_prompt) {
-                        ds4_tokens_free(effective_prompt);
-                        effective_prompt->len = 0;
-                    }
-                    loaded = 0;
-                    kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-                            "%s: kv cache trailer hook rejected, restored snapshot discarded %s",
-                            kv_log_name(kc), path);
-                }
+                hooks->load(hooks->ud, fp, hooks->load_wanted);
             }
         } else {
             ds4_session_invalidate(session);

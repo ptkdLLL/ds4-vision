@@ -26,7 +26,11 @@ typedef enum {
     DS4_THINK_NONE,
     DS4_THINK_HIGH,
     DS4_THINK_MAX,
+    DS4_THINK_LOW,      /* Qwen3.8 reasoning_effort low/medium; other models render them as HIGH */
+    DS4_THINK_MEDIUM,
 } ds4_think_mode;
+/* Explicit numeric effort lives outside the stable named-mode values. */
+#define DS4_THINK_LEVEL_BASE 1000
 
 typedef enum {
     DS4_LOG_DEFAULT,
@@ -52,12 +56,9 @@ typedef struct {
     float logprob;
 } ds4_token_score;
 
-/* DeepSeek 官方采样推荐（模型卡 text agent 评测配置）：temperature=1.0,
- * top_p=0.95，无 min_p 截尾。上游常量 (top_p=1.0/min_p=0.05) 与官方推荐不符，
- * 本 fork 对齐官方文档。仅在客户端未显式传参时生效。 */
 #define DS4_DEFAULT_TEMPERATURE 1.0f
-#define DS4_DEFAULT_TOP_P 0.95f
-#define DS4_DEFAULT_MIN_P 0.0f
+#define DS4_DEFAULT_TOP_P 1.0f
+#define DS4_DEFAULT_MIN_P 0.05f
 
 typedef struct ds4_engine ds4_engine;
 typedef struct ds4_session ds4_session;
@@ -306,8 +307,13 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
+bool ds4_engine_is_qwen4(ds4_engine *e);
+/* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
+const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
+int ds4_think_mode_level(ds4_think_mode mode);
+bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out);
 const char *ds4_think_mode_name(ds4_think_mode mode);
 const char *ds4_think_max_prefix(void);
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode);
@@ -347,9 +353,12 @@ int ds4_dump_chat_tokenization(const char *model_path,
                                const char *system,
                                const char *prompt,
                                ds4_think_mode think_mode,
+                               int ctx_size,
                                FILE *fp);
 int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
+bool ds4_engine_is_deepseek41(ds4_engine *e);
+const char *ds4_deepseek41_reasoning_effort_text(ds4_think_mode mode);
 int ds4_engine_first_token_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_test(ds4_engine *e, const ds4_tokens *prompt);
 int ds4_engine_metal_graph_full_test(ds4_engine *e, const ds4_tokens *prompt);
@@ -359,37 +368,6 @@ void ds4_tokens_push(ds4_tokens *tv, int token);
 void ds4_tokens_free(ds4_tokens *tv);
 void ds4_tokens_copy(ds4_tokens *dst, const ds4_tokens *src);
 bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix);
-
-/* Update the session checkpoint to the given tokens (copies the data).
- * Used by the distributed coordinator after a successful prefill so the
- * KV-cache cold-prefix logic sees the full prompt as a checkpoint. */
-void ds4_session_update_checkpoint(ds4_session *s, const ds4_tokens *tokens);
-
-/* Fork: expose the vision identities retained on a session checkpoint so the
- * server can attach them to disk snapshots (multimodal cache identity). */
-typedef struct {
-    uint32_t token_start;
-    uint32_t token_count;
-    uint8_t fingerprint[32];
-} ds4_session_vision_identity;
-size_t ds4_session_vision_identity_count(const ds4_session *s);
-const ds4_session_vision_identity *ds4_session_vision_identities(
-        const ds4_session *s);
-/* Fork P1 (2026-09-12): adopt a restored (trailer-validated) identity set
- * into the checkpoint so vision-state checks accept a disk restore.  Only
- * effective on a valid checkpoint; callers must have validated the set
- * against the request first. */
-void ds4_session_adopt_vision_identities(ds4_session *s,
-                                         const ds4_session_vision_identity *ids,
-                                         size_t count);
-/* Live (in-progress) identities, for stores that happen mid-prefill. */
-size_t ds4_session_sync_vision_identity_count(const ds4_session *s);
-const ds4_session_vision_identity *ds4_session_sync_vision_identities(
-        const ds4_session *s);
-/* F-1 (2026-10-12): 文本式恢复（无图锚点）后清除 checkpoint vision 身份。
- * 所载前缀无图；陈旧身份不清会让 P2-b 走查在无图前缀上渲染失败。仅清
- * checkpoint 侧（与 ds4_session_invalidate 同法；sync_images 归 sync 出口管）。 */
-void ds4_session_clear_vision_identities(ds4_session *s);
 
 void ds4_tokenize_text(ds4_engine *e, const char *text, ds4_tokens *out);
 void ds4_tokenize_rendered_chat(ds4_engine *e, const char *text, ds4_tokens *out);
@@ -401,6 +379,7 @@ void ds4_encode_chat_prompt(
         ds4_think_mode think_mode,
         ds4_tokens *out);
 void ds4_chat_append_max_effort_prefix(ds4_engine *e, ds4_tokens *tokens);
+void ds4_chat_append_think_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode mode);
 void ds4_chat_append_message(ds4_engine *e, ds4_tokens *tokens, const char *role, const char *content);
 void ds4_chat_append_assistant_prefix(ds4_engine *e, ds4_tokens *tokens, ds4_think_mode think_mode);
 
@@ -420,6 +399,9 @@ int ds4_token_assistant(ds4_engine *e);
  * with the caller. */
 struct ds4_tp;
 int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errlen);
+/* Release gate resources before freeing a bound transport. Sessions must
+ * already be closed. Also called by ds4_engine_close(). */
+void ds4_engine_tp_unbind(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
 void ds4_session_free(ds4_session *s);
@@ -434,9 +416,10 @@ void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
  * callers must not treat it as a durable KV checkpoint boundary. */
 void ds4_session_set_display_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
-/* Optional cooperative cancellation.  ds4_session_sync() checks it only at
- * safe boundaries where the live checkpoint is either unchanged or represents a
- * valid token prefix, and returns DS4_SESSION_SYNC_INTERRUPTED when it stops. */
+/* Cooperative cancellation for ds4_session_sync(), which drains pending work
+ * before returning DS4_SESSION_SYNC_INTERRUPTED. A complete prefix may remain
+ * usable, but a partial layer-major pass is invalidated and the next sync
+ * rebuilds it. Do not assume an interrupted session can be saved or decoded. */
 void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
@@ -456,17 +439,35 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+void ds4_session_set_tp_session_id(ds4_session *s, uint64_t id);
 int ds4_session_sync_multimodal(ds4_session *s,
                                 const ds4_tokens *prompt,
                                 const ds4_vision_span *images,
                                 size_t image_count,
                                 char *err,
                                 size_t errlen);
-/* Return true only when every image that conditioned the live checkpoint has
- * the same token span and embedding fingerprint in the supplied prompt. */
+/* A reusable image prefix has unchanged spans/fingerprints for all historical
+ * images, with any new images starting at or after the live token frontier.
+ * The caller must also check the token prefix. Invalid checkpoints never match. */
+bool ds4_session_vision_prefix_matches(const ds4_session *s,
+                                       const ds4_vision_span *images,
+                                       size_t image_count);
+/* Like the prefix check, but also require exactly the same image count. */
 bool ds4_session_vision_state_matches(const ds4_session *s,
                                       const ds4_vision_span *images,
                                       size_t image_count);
+/* Fingerprint-only image prefix: every historical image matches by row count
+ * and fingerprint, ignoring token positions (which rebase repairs) and
+ * allowing appended request images.  Lets the server routing probe admit
+ * image-append continuations while still rejecting pixel mismatches. */
+bool ds4_session_vision_fingerprint_prefix_matches(const ds4_session *s,
+                                                   const ds4_vision_span *images,
+                                                   size_t image_count);
+/* Restore image positions from an independently authenticated live continuation
+ * (for example, matching tool-call IDs). Checks every fingerprint and row count;
+ * on failure, leaves spans unchanged. This does not verify the text history. */
+bool ds4_session_rebase_vision_state(const ds4_session *s,
+                                     ds4_vision_span *images, size_t image_count);
 /* True while a session contains, or is actively syncing, image-conditioned
  * state. Such state must not be written to the text-keyed disk KV cache. */
 bool ds4_session_has_vision_state(const ds4_session *s);
@@ -475,6 +476,16 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
+bool ds4_session_checkpoint_valid(const ds4_session *s);
+/* Test helpers (ds4-test): allocate a session shell holding only the given
+ * checkpoint tokens, for server-side routing/probe unit tests.  Not usable
+ * for inference; free with ds4_session_free_test_checkpoint(). */
+ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
+void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Attach synthetic image identities to a test checkpoint (copies
+ * token_start/row-count/fingerprint per span).  Not usable for inference. */
+void ds4_session_set_test_images(ds4_session *s,
+                                 const ds4_vision_span *images, size_t n);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_session_argmax_ignoring_eos(ds4_session *s,
@@ -483,6 +494,9 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+/* Teacher-force a V4.1 verification block, returning logits after each token. */
+int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
+                                float *logits, char *err, size_t errlen);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,
@@ -512,6 +526,7 @@ int ds4_test_speculative_delta_sample(const float *target_logits,
 int ds4_test_argmax_excluding_logits(const float *logits, uint32_t n_vocab,
                                      int excluded_id);
 uint64_t ds4_test_mixed_native_count(void);
+uint64_t ds4_test_ds41_batch_count(void);
 #endif
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
@@ -532,6 +547,16 @@ typedef struct {
  * sequential fallback. */
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen);
+/* One speculative cycle for a batch of sessions (greedy acceptance, Qwen3.8
+ * with --mtp): each item feeds its token; a pending draft rides along as a
+ * second row and is committed when it is the target's argmax.  accepted[i]
+ * lists the tokens committed for item i (the fed token, then the draft) and
+ * n_accepted[i] how many; the session's logits then follow its last
+ * committed token.  Engines without native batching run one cycle per
+ * session in turn. */
+int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen);
 /* Advance one resumed prefill suffix and an independent decode batch as one
  * scheduling step. Unsupported combinations use the ordinary serialized
  * session operations. */
@@ -559,14 +584,28 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+ * (keep, or roll back and replay). flags are the VERIFY frame's
+ * DS4_TP_VERIFY_* bits. Only called from ds4_tp_worker_run. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
-                              char *err, size_t errlen);
+                              uint32_t flags, char *err, size_t errlen);
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
+/* TP worker side of a lockstep DSpark DRAFT/MAINTAIN frame (mode is a
+ * DS4_TP_DSPARK_* value).  Only called from ds4_tp_worker_run. */
+int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
+                                uint32_t mode, char *err, size_t errlen);
+/* Internal TP restore: no collectives and no logits exchange. Return 0 after
+ * restoring a recent verifier prefix, 1 if unavailable, -1 on copy failure.
+ * Logits are valid only at the block start; otherwise replay before sampling. */
+int ds4_session_restore_speculative_prefix(ds4_session *s, int pos);
 void ds4_session_invalidate(ds4_session *s);
-/* Keep the token prefix, restoring recurrent state where possible. Otherwise
- * the checkpoint becomes invalid: sync the retained prefix before eval.
+/* Try a recent speculative rewind, including valid next-token logits. False
+ * means the caller must use ordinary rewind/sync before continuing; a failed
+ * restore may have invalidated the checkpoint. */
+bool ds4_session_rewind_speculative(ds4_session *s, int pos);
+/* Keep the token prefix, restoring recurrent state where possible. This may
+ * copy GPU state and replay a bounded speculative suffix on both TP ranks.
+ * Otherwise the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
@@ -576,6 +615,7 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+bool ds4_engine_mtp_exact_sampling(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The

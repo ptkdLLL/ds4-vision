@@ -4,10 +4,15 @@ This repository is a fork of DwarfStar 4 ("ds4.c"):
     https://github.com/antirez/ds4
 
 Upstream is distributed under the MIT License (see LICENSE; copyright "The ds4.c authors",
-and "The ggml authors" for lineage pieces). Fork additions — the distributed vision path,
-deterministic image markers, prefix-walk cache reuse, launcher scripts and the
-pi-extensions/ package — are provided under the same MIT License.
+and "The ggml authors" for lineage pieces). Fork additions — the V4.1 Flash dual-machine
+tensor-parallel integration, append-only image history, server-side image-embedding cache
+(RAM + SSD), 128 MiB HTTP body limit, and this documentation — are provided under the same
+MIT License.
 
-Model weights are NOT distributed with this repository. "DeepSeek V4 Flash" and the
-vision-encoder GGUF files are obtained separately; see download_model.sh and upstream
-documentation.
+The previous image-window / drop-after-reading client design is not part of this version.
+Images are kept in the conversation history; the server caches their embeddings so they are
+encoded only once. The optional webp-to-png conversion is no longer required: convert to
+PNG/JPEG on the client before the first send if needed.
+
+Model weights are NOT distributed with this repository. DeepSeek V4.1 Flash and its vision
+encoder GGUF files are obtained separately; their licenses are provided by their publishers.

@@ -1,250 +1,269 @@
 # ds4-vision
 
-> **Fork notice**: this is a fork of [DwarfStar 4](https://github.com/antirez/ds4) ("ds4.c",
-> MIT). The engine, server and agent are upstream's; this fork adds a **distributed vision
-> (multimodal) path built around one hard requirement: prompt-cache reuse must survive
-> images.**
+**DeepSeek V4.1 Flash · dual-machine tensor-parallel vision · append-only image history · server-side image-embedding cache**
+
+> **English summary.** This fork replaces the previous *image-window / drop-after-reading*
+> design with an **append-only image history** plus a **server-side image-embedding cache**
+> (RAM + SSD). Images stay available to the model instead of being replaced by markers, so
+> implicit references such as “this screenshot” no longer force the model to guess. The
+> prompt/KV prefix cache is preserved across turns; each image is encoded once and reused
+> from the embedding cache afterwards. The repository is a fork of
+> [DwarfStar 4 (`ds4.c`)](https://github.com/antirez/ds4), MIT licensed.
 >
-> **What's added**: a vision encoder on the coordinator with synthetic image tokens routed
-> through the layer-sliced pipeline (`0:23` / `24:output`); **deterministic 36-byte image
-> markers** as stable image identity across turns; a **byte-level prefix walk** with
-> structural (offset) and fingerprint binding, fail-closed on any ambiguity; **multimodal
-> disk snapshots** with a two-way-validated vision trailer; and a **pi extension package**
-> (`pi-extensions/`) implementing the client half of the cache contract — consume-and-mirror
-> image replacement (`image-window`) and deterministic WebP->PNG pre-read conversion
-> (`webp-to-png`).
->
-> **Start here**: **[VISION_FORK.md](VISION_FORK.md)** for the full story, design notes and
-> limitations. Everything below is upstream's README.
+> **中文摘要。** 本仓库是 `ds4.c` 的 fork。旧版 `image-window` 在图片看过一轮后把它替换成
+> 36 字节 marker，后续轮次模型看不到像素，遇到“这张图/刚才的截图”这类隐式指代只能幻觉
+> 作答。本版改为 **图片历史只增不减（append-only）**，并在服务端增加 **图像 embedding 缓存**
+> （RAM + SSD）：图片只编码一次，后续轮次直接命中缓存；prompt/KV 前缀缓存继续工作。旧的
+> `image-window` 已移除。
 
-<p align="center">
-  <img src="logo.svg" alt="DwarfStar logo" width="220">
-</p>
+---
 
-**DwarfStar** is a small native inference engine optimized first for
-**DeepSeek V4 Flash** (including the experimental vision model).
-It also supports **GLM 5.2 and 5.3**, **GLM 5.3 Flash**, and
-**DeepSeek V4 PRO**. It is self-contained and
-deliberately narrow, not a general GGUF runner. Model loading, prompt rendering,
-tool calls, KV state, the HTTP server, and the coding agent are built and tested together.
-The repository also includes tools and data for GGUF, imatrix, quality, and speed.
+## 1. 为什么重做
 
-Supported backends:
+### 1.1 旧设计：读完即弃
 
-* **Metal**, the primary target, on Macs with 96 GB or more. Smaller machines
-  can use SSD streaming.
-* **NVIDIA CUDA**, including multi-GPU systems and DGX Spark.
-* **ROCm** on Strix Halo systems such as the Framework Desktop.
+旧 fork 的 `pi-extensions/image-window` 会在图片“看过一轮”后，把历史里的 image part 替换成
+一个固定 36 字节的 marker，目的是让后续请求的序列化字节保持稳定、继续命中 KV 前缀缓存。
+这个设计在“每轮只讨论刚看过的图”时工作得很好，但有一个致命缺陷：
 
-This project would not exist without **llama.cpp and GGML**, make sure to read
-the acknowledgements section, a big thank you to Georgi Gerganov and all the
-other contributors.
+- 后续轮次里，模型只看到 marker，看不到图片像素；
+- 用户说“这张图”“刚才那个截图”“左边那个门”时，模型没有视觉证据；
+- 模型只能根据文字上下文猜，**隐式提及图片时会幻觉回答**；
+- 一旦猜错，后续推理会建立在错误前提上，且很难从日志里发现。
 
-Model support is intentionally opportunistic. The project follows the best open
-weights for useful local machine sizes, especially 128 GB laptops and 512 GB
-workstations. A model may be removed when a better replacement arrives.
+问题的本质不是缓存，而是**把图片从模型的可见上下文里删掉了**。
 
-The project has first class support for SSD streaming of weights, so it is
-possible to run models bigger than RAM while often still getting decent
-performances, and even running very large models (like the full GLM 5.3 or DeepSeek v4 PRO)
-on systems with just 128GB of RAM at a slower speed, but fast enough for
-QA-style chats.
+### 1.2 新设计：图片只增不减 + 服务端图像缓存
 
-# So, what can I do with this software?
+本版不再删除或替换历史图片：
 
-* You can run a very capable models in your consumer hardware, a MacBook, a DGX Spark, or a Strix Halo for example. Even if you have not enough RAM, with SSD streaming, you can run it at a decent speed.
-* You can use multiple CUDA cards as a multi-user LLM server. Ada Lovelace, including L40S, is supported: newer models can run here even when their other inference implementations require newer GPUs. Our eight-L40S Flash setup has reached about 126 t/s aggregate generation with 16 sessions.
-* Using two 128 GB Macs connected with RDMA, you can run 4-bit DeepSeek Flash or GLM 5.3 Flash with tensor parallelism. Larger GLM 5.2 quants need larger machines, such as Mac Studios.
-* You can also use pipeline paralellism to glue together multiple systems to sum their RAM and run larger models.
+1. **append-only 图片历史**：图片一旦进入会话，就一直留在 prompt 里；
+2. **服务端图像 embedding 缓存**：每张图只在第一次出现时跑 vision encoder，之后从
+   RAM/SSD 缓存加载 embedding，避免“每轮开头重算所有历史图”；
+3. **prompt/KV 前缀缓存**：图片 marker 与 fingerprint 稳定，历史前缀可复用，只 prefill
+   新文本/新图片；
+4. **数量与字节上限**：`SERVER_MAX_IMAGES=256`，HTTP body 上限在本 fork 为 128 MiB；
+   大图仍建议客户端降采样或提高上限。
 
-## Motivations
+这样模型始终能看到全部图片，同时不必为历史图片反复付编码成本。
 
-* Capable open-weight models now fit on high-end personal machines.
-* DeepSeek V4 Flash and PRO, GLM 5.2, tolerate aggressive routed-expert quantization.
-* Compressed KV caches and fast local SSDs make long contexts practical.
-* The idea of an inference system specialized for a few models.
+---
 
-# AI full disclosure
+## 2. 架构
 
-* This software is developed with **strong assistance from GPT 5.5, 5.6, Claude Fable** and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you. The acknowledgement below is equally important: this would not exist without `llama.cpp` and GGML, largely written by hand.
-
-## Acknowledgements to llama.cpp and GGML
-
-`ds4.c` does not link against GGML, but it **exists thanks to the path opened by the
-llama.cpp project and the kernels, quantization formats, GGUF ecosystem, and hard-won
-engineering knowledge developed there**.
-We are thankful and indebted to [`llama.cpp`](https://github.com/ggml-org/llama.cpp)
-and its contributors. Their implementation, kernels, tests, and design choices were
-an essential reference while building this DeepSeek V4 specific inference path.
-Some source-level pieces are retained or adapted here under the MIT license: GGUF
-quant layouts and tables, CPU quant/dot logic, and certain kernels. For this
-reason, and because we are genuinely grateful, we keep the GGML authors copyright
-notice in our `LICENSE` file.
-
-## Status
-
-The software is currently very fast changing. Consider it beta quality.
-Before each release, a big QA run is executed, however instabilities
-are definitely possible.
-
-# How to use this project?
-
-I (Salvatore) believe that the way projects should be shipped and used changed because of AI. The main differences today are:
-
-1. With AI, users can modify the software in significant ways with low efforts, costs, and even lacking deep domain knowledge about the task they want to accomplish. For instance, a DwarfStar user with a specific hardware setup can ask a coding agent to improve the inference speed of this software for the specific hardware setup, asking the model to reach the maximum prefill and generation speed without impacting correctness, and also asking to do a deep QA pass.
-2. Similiarly, because of "1", software may be shipped in a different way than before. It must be more a working template for the biggest use cases, without trying to cover every possible setup. If DwarfStar showcases a few good implementations of tensor parallel execution, the code will work as a rail for implementing the same feature in specific conditions, for a new model, and so forth.
-
-So, while this project attempts to be usable for the featured models and the most common hardware setups, I ask you, if you have access to coding agents, to consider using coding agents as an interface to discover the project, make modifications, create personalized setups. This way you can likely do more than what we ship, and certain things that are not documented or implemented, and that you require, are potentially very easy to achieve.
-
-## Start Here
-
-```sh
-git clone https://github.com/antirez/ds4.git
-cd ds4
+```text
+Pi / OpenAI-compatible client
+        │  full history every turn (images stay in history)
+        ▼
+Coordinator  (Apple Silicon, HTTP 8005, TP 9916)
+  ├─ image embedding cache
+  │    ├─ RAM: 64 entries / 512 MiB, LRU
+  │    └─ SSD: <cache-dir>/v<version>/xx/<fingerprint>.emb, 2 GiB default
+  ├─ prompt / KV prefix cache (500K context)
+  └─ vision encoder sidecar
+        │  tensor-parallel, TCP, 50/50 expert ownership
+        ▼
+Worker  (Apple Silicon, TP client)
 ```
 
-Choose your build. The platform guides cover prerequisites, memory sizing,
-and hardware-specific setups:
+- 双机 **tensor parallel**（不是旧的 layer-sliced pipeline），`--transport tcp`；
+- `--ctx 500000`，`DS4_METAL_V41_PREFILL_CHUNK=256`；
+- coordinator 承担 HTTP、vision encoder、图像缓存与 prompt cache；
+- worker 只做 TP 计算，不参与 HTTP/图片缓存。
 
-| Platform guide | Build |
-| --- | --- |
-| [Metal on Apple Silicon](docs/METAL.md) | `make` |
-| [DGX Spark](docs/DGX_SPARK.md) | `make cuda-spark` |
-| [Strix Halo / Framework Desktop](docs/STRIX_HALO.md) | `make strix-halo` |
-| [One or more CUDA cards, including Ada/L40S](docs/CUDA_MULTI_GPU.md) | `make cuda-generic` |
+---
 
-For a first run on a 96 or 128 GB machine, download DeepSeek V4 Flash Q2:
+## 3. 关键机制
 
-```sh
-./download_model.sh ds4f-q2
-```
+### 3.1 图片身份稳定
 
-Downloads go in `gguf/`. Repeat the command to resume an interrupted download.
-Leave memory for the context and runtime buffers as well as the model.
-See [other models](docs/MODELS.md) or use [SSD streaming](docs/SSD_STREAMING.md)
-on a smaller Mac.
+图片在渲染文本里是确定性的 marker，身份由图片字节的 fingerprint 决定。相同图片在不同轮次
+产生相同 marker；图片位置/顺序不变时，历史前缀可复用。
 
-## Everyday Use
+**不要在两轮之间改写旧图片**：降采样、转码、重新压缩都会改变图片字节，从而改变缓存身份。
+如果必须换图，把它当成一次新的图片进入历史，接受一次冷启动。
 
-Once built and with a model downloaded:
+### 3.2 图像 embedding 缓存
 
-```sh
-./ds4
-./ds4 -p "Explain Redis streams in one paragraph."
-./ds4-agent
-./ds4-server --ctx 32768
-```
+`server_encode_image()` 的顺序：
 
-The default model is `ds4flash.gguf`, a link updated by main-model downloads.
-Pass `-m FILE` to choose explicitly. Commands normally run from the repository
-root; use `--chdir /path/to/ds4` when launching elsewhere.
+1. RAM cache（按图片字节精确匹配，LRU）；
+2. SSD `.emb` cache（按 32 字节 fingerprint，带 header/checksum）；
+3. 都没有才跑 vision encoder，并把结果写回 RAM/SSD。
 
-The server listens at `http://127.0.0.1:8000` by default; see [serving](docs/SERVER.md)
-for API access and multiple sessions.
+缓存的是 **编码后的 embedding**，不是原始图片。HTTP body 仍然包含图片 base64；因此
+“图片字节数”和“embedding 缓存”是两个独立的约束。
 
-The interactive CLI keeps a multi-turn conversation. Use `/help`, `/read FILE`,
-`/ctx N`, and `/quit`. Ctrl+C interrupts generation and returns to the prompt.
-Run each binary with `--help` for its full options.
+### 3.3 prompt/KV 前缀缓存
 
-### Native coding agent
+Pi 等 agent 每轮重发完整历史。服务端比较 live KV 与请求前缀：
 
-`ds4-agent` runs inference directly, without a separate HTTP server. It keeps
-the token history and live model state together, shows prefill progress, and
-uses the model's native tool format. DeepSeek and GLM have their own templates.
+- 图片 fingerprint 序列一致时，`multimodal live kv hit`；
+- 只 prefill 新增的文本/图片 token；
+- 前缀不一致时回退到全量/部分 prefill，不会错误复用。
 
-Sessions are stored in `~/.ds4/kvcache`:
+### 3.4 图片数量与 body 上限
 
-| Command | Action |
-| --- | --- |
-| `/save` | Save the current session |
-| `/list` | List saved sessions |
-| `/switch <sha>` | Resume a session |
-| `/del <sha>` | Delete a saved session |
-| `/strip <sha>` | Keep text and title, removing the large KV payload |
+- `SERVER_MAX_IMAGES=256`（单请求历史图片总数）；
+- `max_body=128 MiB`（本 fork；原版为 64 MiB）；
+- 128 MiB 只解决 HTTP 准入，不等于“无限图片”：100 张 1.9–3.3 MB 截图仍可能超过；
+  100 张 960×640 小图（约 39 MB）则很宽裕。
 
-Compatible local KV snapshots avoid rebuilding the prompt. Stripped sessions
-and network TP restores require prefill. Sessions containing images cannot yet
-be saved. Saved conversations and traces may contain private information.
+---
 
-For Pi, OpenCode, Codex CLI, or Claude Code, use `ds4-server` instead and follow
-the [client setup guide](docs/CLIENTS.md).
+## 4. 实测数据
 
-### Models, images, and speculation
+### 4.1 120 张 960×640 小图
 
-[Models and vision](docs/MODELS.md) lists the supported downloads and memory
-requirements. DeepSeek Vision Experimental uses a different checkpoint from
-Flash 0731; GLM 5.3 Flash adds vision to the same text model.
+| 指标 | 结果 |
+|---|---:|
+| 图片数 / body | 120 张 / 46.5 MB |
+| 首次编码 | 120 次（每张一次） |
+| 后续轮次 | 648 次 RAM 命中、1512 次 SSD 命中、0 次重复编码 |
+| prompt cache | 35 次 `multimodal live kv hit`、1 次冷启动 miss，整体 98.91% |
+| 文本轮耗时 | 3.5–14 s；图片批 44–83 s |
 
-With the matching encoder passed as `--vision FILE`, use `/read image.png`
-in the CLI or `view_image` in the native agent.
+### 4.2 35 张 1.9 MB 级截图
 
-Speculative decoding is opt-in. GLM uses `--mtp`; Flash DSpark needs a matching
-support GGUF. It can improve generation, but not every workload benefits.
-Read [speculative decoding](docs/SPECULATIVE_DECODING.md) for setup and the
-difference between default opportunistic sampling and `--mtp-exact-sampling`.
+| 轮次 | prompt | prompt cache | prefill | 图像 embedding |
+|---|---:|---|---:|---|
+| T1 冷启动 | 348,236 | miss（预期） | 995.7 s | 19 编码 + 16 磁盘命中 |
+| T2 首轮工具后 | 358,336 | 一次性 `common=6639` 前缀切换 | 1,035.5 s | 35 磁盘命中、0 编码 |
+| T3 新图 36 | 360,505 | `multimodal live kv hit` | 46 tokens / 1.19 s | 新图 1 次编码 |
+| T4 新图 37 | 361,373 | `multimodal live kv hit` | 823 tokens / 6.71 s | 新图 1 次编码 |
 
-### Output and power
+结论：历史图在 T2 已全部命中、0 编码；T3/T4 只为新读入的图各编码一次。T2 的一次性 miss
+来自恢复会话后的前缀变化（系统/工具前缀），不是 `max_body`；T3/T4 已恢复命中。
 
-Thinking is enabled by default. Use `--nothink` or `/nothink` for direct
-answers, and `--think` or `/think` to enable it again.
-The normal sampling defaults are temperature 1, top-p 1, and min-p 0.05;
-`--temp 0` selects greedy output.
+### 4.3 128 MiB 边界
 
-For DeepSeek, `--power N` trades throughput for lower sustained GPU load.
-The default is 100. GLM currently requires `--power 100`.
+- `Content-Length: 134217729`（128 MiB+1）→ 立即 `400 bad HTTP request`；
+- `Content-Length: 134000000` → body 读完，进入 JSON 解析；
+- 约 67 MB 的真实 Pi session 请求通过并完成冷启动 prefill。
 
-DeepSeek Flash and GLM 5.3 Flash also support directional steering. Load a
-vector with `--dir-steering-file FILE`; `/steer F` adjusts its scale for
-subsequent tokens in a local CLI or agent session, without rebuilding the
-existing KV cache. See [steering documentation](dir-steering/README.md).
+按当前 1.9–3.3 MB/张，128 MiB 大约支持 **65–70 张**；100 张全分辨率需要更大上限或先降采样。
+100 张 960×640 小图不受此限。
 
-`--prefix-file FILE` preloads complete `USER:` / `ASSISTANT:` pairs before
-the live conversation. A turn marker must start a line, roles must alternate,
-and the last turn must be `ASSISTANT:`.
+---
 
-## Capability Evaluation
+## 5. 快速开始
 
-`ds4-eval` runs embedded capability regression tests against a real GGUF.
-These are DwarfStar integration checks, not official leaderboard scores.
+### 5.1 构建
 
 ```sh
-./ds4-eval -m ds4flash.gguf --trace /tmp/ds4-eval.txt
-./ds4-eval -m ds4flash.gguf --suite hard-smoke
-./ds4-eval -m ds4flash.gguf --suite hard --retry-incomplete
+git clone https://github.com/ptkdLLL/ds4-vision.git
+cd ds4-vision
+make -j
 ```
 
-The default suite is `core`; `--suite all` runs core and hard cases.
-`--list-cases` lists tests without loading a model. `--plain` selects
-non-interactive output, and `--regrade-trace FILE` scores an existing trace
-without generating again. Sources and licenses are in [EVAL_DATA.md](EVAL_DATA.md).
-For inference correctness and release checks, read [testing](docs/TESTING.md).
+构建产物：`ds4`（worker/CLI）与 `ds4-server`（coordinator）。
 
-## Speed
+模型权重 **不包含** 在本仓库。请自行获取 DeepSeek V4.1 Flash 的 GGUF 与 vision sidecar
+（Q2 量化 + vision encoder），并遵守模型自身的许可。
 
-This recorded DeepSeek V4 Flash Q2 sweep uses an M5 Max with 128 GB RAM,
-2048-token continued-prefill intervals, and 128 greedy generation tokens per
-frontier. It is a baseline, not a fresh benchmark of every commit.
+```sh
+export MODEL=/path/to/DeepSeek-V4.1-Flash-Q2.gguf
+export VISION=/path/to/DeepSeek-V4.1-Flash-Vision.gguf
+```
 
-![M5 Max Flash Q2 throughput](speed-bench/m5_max_ts.svg)
+### 5.2 启动 worker（先）
 
-See [performance and benchmarking](docs/PERFORMANCE.md) for the full numbers,
-DGX Spark results, comparison conditions, and benchmark commands.
+```sh
+DS4_METAL_V41_PREFILL_CHUNK=256 \
+./ds4 -m "$MODEL" --vision "$VISION" \
+  --tensor-parallel --role worker \
+  --coordinator <COORDINATOR_IP> 9916 --transport tcp \
+  --ctx 500000 --power 100
+```
 
-## Detailed Guides
+### 5.3 启动 coordinator（后）
 
-- [Models and vision](docs/MODELS.md): Flash, PRO, GLM, and matching encoders.
-- [SSD streaming](docs/SSD_STREAMING.md): run larger than RAM and size the cache.
-- [Inference across machines](docs/DISTRIBUTED.md): two-Mac TP/RDMA and layer pipelines.
-- [Speculative decoding](docs/SPECULATIVE_DECODING.md): DSpark, GLM MTP, and sampling.
-- [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
-- [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
-- [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
-- [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
+```sh
+DS4_METAL_V41_PREFILL_CHUNK=256 \
+DS4_IMAGE_EMBED_CACHE_DIR="$HOME/.cache/ds4-image-embed" \
+DS4_IMAGE_EMBED_CACHE_BYTES=2147483648 \
+DS4_IMAGE_EMBED_CACHE_VERSION=1 \
+./ds4-server -m "$MODEL" --vision "$VISION" \
+  --tensor-parallel --role coordinator \
+  --listen <COORDINATOR_IP> 9916 --transport tcp \
+  --ctx 500000 --power 100 \
+  --host 127.0.0.1 --port 8005 --cors
+```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
+API：`http://127.0.0.1:8005/v1`，模型 id 为 `deepseek-v4.1-flash`。
 
-## Logo
+> 两台机器的模型路径、vision 路径、commit 必须一致；worker 必须先启动。
+> 不要使用 `--ssd-streaming`；本部署是 resident + TP。
 
-The DwarfStar logo was designed by hand by Salvatore Sanfilippo, made more
-graphical with AI, and manually reworked by Ben Gnomino, whose human touch made
-it rock.
+---
+
+## 6. 配置
+
+| 项 | 默认/说明 |
+|---|---|
+| `--ctx` | `500000` |
+| `DS4_METAL_V41_PREFILL_CHUNK` | `256` |
+| `SERVER_MAX_IMAGES` | `256`（源码常量） |
+| `max_body` | `128 MiB`（本 fork；原版 64 MiB） |
+| `DS4_IMAGE_EMBED_CACHE_DIR` | 缓存目录，必须可写；建议 700 权限 |
+| `DS4_IMAGE_EMBED_CACHE_BYTES` | 默认 2 GiB；100 张大图建议 4–8 GiB |
+| `DS4_IMAGE_EMBED_CACHE_VERSION` | 缓存版本目录；换模型/编码器时递增 |
+| RAM image cache | 64 项 / 512 MiB，LRU（源码常量） |
+| TP | 50/50 expert ownership，TCP |
+
+SSD `.emb` 缓存**满即跳过新写入、不自动淘汰**。长期运行请定期清理旧版本/旧图片，或提高
+缓存配额；否则未写进缓存的图片会在后续轮次重新编码。
+
+---
+
+## 7. 客户端契约
+
+为了同时保住“模型看得见图”和“prompt cache 命中”：
+
+1. **每轮发送完整历史**（OpenAI Chat Completions 语义）；
+2. **不要删除/替换历史图片**：不要使用旧的 `image-window`/drop-oldest；
+3. **不要在两轮之间改写旧图片**：降采样/转码/重新压缩会改变缓存身份；
+4. 图片先用 PNG/JPEG；WebP/GIF 可在首次发送前转成 PNG；
+5. 如果使用 Pi：`read` 工具返回的 image toolResult 会随历史重发；服务端负责 embedding 缓存，
+   不需要旧的 image-window 扩展；
+6. 客户端 compaction 如果摘要/丢弃图片，模型会失去像素——这是“隐式提及幻觉”的来源，
+   图片密集会话应避免在任务中途丢掉旧图。
+
+---
+
+## 8. 与旧 fork/上游的关系
+
+- 上游：`antirez/ds4`（DwarfStar 4），MIT；
+- 旧 fork：distributed vision + layer-sliced pipeline + `image-window`/`webp-to-png`；
+- 本版：V4.1 Flash、双机 TP/TCP、500K、vision、append-only 图片历史、服务端图像 embedding
+  缓存、128 MiB body；
+- 旧 `image-window` 已移除；`webp-to-png` 不再是必需组件（需要时在客户端先转 PNG）；
+- 旧 `start-cluster-vision.sh`（layer-sliced）不再适用；使用上面的 TP worker/coordinator
+  命令。
+
+上游的大型 QA/训练数据集未包含在本 fork；需要时请到上游仓库获取。
+
+---
+
+## 9. 已知限制
+
+- 模型权重、vision sidecar 不随仓库分发；
+- 双机内存/带宽是硬约束；500K ctx + resident 权重需要足够统一内存；
+- 128 MiB body 对 100 张 1.9–3.3 MB 截图仍不够；请降采样、提高上限或使用更大的 body 预算；
+- 冷启动首轮需要全量 prefill + 缺失图片编码；本实测 348K tokens 约 16.6 min；
+- SSD 图像缓存无自动淘汰；需要手工清理/提高配额；
+- 单驻留槽推理；并发大请求会叠加内存，生产环境应限制并发；
+- 旧设计的历史会话如果已经被替换成 marker，重新启用 append-only 需要从头恢复图片历史；
+- 本项目是实验性 fork，不提供任何保证。
+
+---
+
+## 10. 许可与致谢
+
+MIT License，与上游一致。见 `LICENSE` 与 `NOTICE`。
+
+- 上游：[DwarfStar 4 / ds4.c](https://github.com/antirez/ds4)，MIT；
+- 模型：DeepSeek V4.1 Flash 及其 vision encoder，权重与许可由模型发布方提供；
+- 本项目与 DeepSeek、Apple、DwarfStar 上游均无隶属关系。
+
+没有 `llama.cpp`/GGML 打开的道路，就不会有 `ds4.c`；感谢上游与 GGML 社区。

@@ -16,10 +16,6 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
-/* fork: snapshots for multimodal sessions carry image identities
- * (fingerprints + token ranges) in a trailer block so image-conditioned KV
- * rows can be restored only for the exact same images. */
-#define DS4_KVSTORE_EXT_VISION            (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -161,8 +157,7 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size,
-                                 uint8_t require_ext_flags);
+                                 int model_id, int quant_bits, int ctx_size);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -198,7 +193,6 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                               ds4_tokens *effective_prompt,
                               ds4_kvstore_load_result *result,
                               const ds4_kvstore_trailer_hooks *hooks,
-                              uint8_t require_ext_flags,
                               bool responses_protocol);
 void ds4_kvstore_load_result_free(ds4_kvstore_load_result *result);
 
@@ -219,5 +213,7 @@ char *ds4_kvstore_path_join(const char *dir, const char *name);
 char *ds4_kvstore_path_for_sha(ds4_kvstore *kc, const char sha[41]);
 void ds4_kvstore_le_put32(uint8_t *p, uint32_t v);
 uint32_t ds4_kvstore_le_get32(const uint8_t *p);
+
+bool ds4_kvstore_quant_bits_supported(int quant_bits);
 
 #endif

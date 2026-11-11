@@ -14,7 +14,6 @@
  */
 
 #include "ds4_distributed.h"
-#include "ds4_image.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -43,7 +42,6 @@
  * ========================================================================= */
 
 #define DS4_DIST_MAGIC 0x44533444u /* DS4D */
-#define DS4_DIST_MAX_LISTEN_FDS 2
 #define DS4_DIST_MSG_HELLO 1u
 #define DS4_DIST_MSG_ERROR 2u
 #define DS4_DIST_MSG_WORK 3u
@@ -69,10 +67,6 @@
 #define DS4_DIST_ROUTE_RETURN_UPSTREAM 1u
 #define DS4_DIST_RECV_TRANSPORT_ERROR 1
 #define DS4_DIST_RECV_REMOTE_ERROR 2
-/* Local layer evaluation failed on the coordinator itself (e.g. Metal encode):
- * the workers/route are healthy — callers must not evict route workers nor
- * replay the whole prompt through the same local failure. */
-#define DS4_DIST_LOCAL_EVAL_ERROR 3
 #define DS4_DIST_SNAPSHOT_CHUNK_BYTES (8u * 1024u * 1024u)
 
 typedef struct {
@@ -276,8 +270,7 @@ typedef struct {
     uint32_t layer_end;
     bool has_output;
     int ctx_size;
-    int listen_fds[DS4_DIST_MAX_LISTEN_FDS];
-    int n_listen_fds;
+    int listen_fd;
     pthread_mutex_t mu;
     ds4_dist_worker_session *sessions;
 } ds4_dist_worker_state;
@@ -1091,8 +1084,6 @@ static int dist_write_full(int fd, const void *buf, size_t len) {
         ssize_t n = send(fd, p, len, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "ds4: DEBUG dist_write_full send failed len=%zu errno=%d\n",
-                    len, errno);
             return -1;
         }
         if (n == 0) return -1;
@@ -1229,10 +1220,6 @@ static int dist_open_listener(const char *host, int port, char *err, size_t errl
         if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
             listen(fd, 64) == 0) {
             listen_fd = fd;
-            char addr_str[NI_MAXHOST + NI_MAXSERV + 8];
-            dist_sockaddr_string(ai->ai_addr, ai->ai_addrlen, addr_str, sizeof(addr_str));
-            fprintf(stderr, "ds4: DEBUG dist_open_listener bound family=%d addr=%s fd=%dn", ai->ai_family, addr_str, fd);
-            fflush(stderr);
             break;
         }
 
@@ -1244,75 +1231,6 @@ static int dist_open_listener(const char *host, int port, char *err, size_t errl
         snprintf(err, errlen, "unable to listen on %s:%d: %s", host_display, port, strerror(errno));
     }
     return listen_fd;
-}
-
-/* 返回成功绑定的 fd 数量；与 dist_open_listener 不同，不 break。
- * IPv4 地址优先（out_fds[0]），因为在 macOS Thunderbolt 桥上
- * IPv6 dual-stack socket 的 accept() 可能无法正确处理远程 IPv4 连接。 */
-static int dist_open_listener_all(const char *host, int port,
-                                   int *out_fds, int max_fds,
-                                   char *err, size_t errlen) {
-    char portbuf[16];
-    snprintf(portbuf, sizeof(portbuf), "%d", port);
-    const char *host_display = host ? host : "*";
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_flags = AI_PASSIVE;
-
-    struct addrinfo *res = NULL;
-    int gai = getaddrinfo(host, portbuf, &hints, &res);
-    if (gai != 0) {
-        if (errlen) snprintf(err, errlen, "getaddrinfo(%s:%s): %s",
-                             host_display, portbuf, gai_strerror(gai));
-        return -1;
-    }
-
-    int count = 0;
-
-    /* 第一遍：只绑定 IPv4 地址 */
-    for (struct addrinfo *ai = res; ai && count < max_fds; ai = ai->ai_next) {
-        if (ai->ai_family != AF_INET) continue;
-        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        /* 不在监听 socket 上设置 TCP_NODELAY/SO_KEEPALIVE/SO_SNDTIMEO；
-         * 这些选项在 macOS  Thunderbolt 桥上可能导致 accept() 异常 */
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
-            listen(fd, 64) == 0) {
-            out_fds[count++] = fd;
-        } else {
-            close(fd);
-        }
-    }
-
-    /* 第二遍：绑定 IPv6 地址（使用独立端口，V6ONLY=1 避免与 IPv4 冲突） */
-    for (struct addrinfo *ai = res; ai && count < max_fds; ai = ai->ai_next) {
-        if (ai->ai_family != AF_INET6) continue;
-        int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
-        int one = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        int v6only = 1;
-        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
-        /* 不在监听 socket 上设置 TCP_NODELAY/SO_KEEPALIVE/SO_SNDTIMEO */
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
-            listen(fd, 64) == 0) {
-            out_fds[count++] = fd;
-        } else {
-            close(fd);
-        }
-    }
-
-    freeaddrinfo(res);
-    if (count == 0 && errlen) {
-        snprintf(err, errlen, "unable to listen on %s:%d: %s",
-                 host_display, port, strerror(errno));
-    }
-    return count;
 }
 
 static int dist_listener_port(int fd) {
@@ -1491,8 +1409,6 @@ static int dist_connect_endpoint_once(const char *host, int port, int *last_errn
             }
         }
         if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) {
-            fprintf(stderr, "ds4: DEBUG connect_endpoint connected family=%d dst=%s fd=%dn", ai->ai_family, dst_desc, fd);
-            fflush(stderr);
             if (trace) {
                 struct sockaddr_storage local_ss;
                 socklen_t local_len = sizeof(local_ss);
@@ -2628,9 +2544,6 @@ static int dist_coordinator_send_remote_work_on_fd(
     work.route_index = 0;
     work.route_bytes = plan->blob_bytes;
 
-    fprintf(stderr, "ds4: DEBUG send_remote_work req=%llu pos=%u tokens=%u flags=0x%x route_count=%u route_index=%u fd=%dn",
-            (unsigned long long)(dist_u64_from_halves(work.request_hi, work.request_lo)),
-            work.pos0, work.n_tokens, work.flags, work.route_count, work.route_index, fd);
     if (dist_send_work_frame(fd, &work, tokens, hidden_hc, plan->blob) != 0) {
         if (errlen) snprintf(err, errlen, "failed to send distributed work");
         return 1;
@@ -2680,8 +2593,6 @@ static int dist_coordinator_eval_remote_on_fd(
     uint64_t result_hash = 0;
     void *payload = NULL;
     if (rc == 0) {
-        fprintf(stderr, "ds4: DEBUG eval_remote_on_fd send done, waiting recv req=%llu fd=%d\n",
-                (unsigned long long)request_id, fd);
         const double recv_t0 = profile ? dist_now_sec() : 0.0;
         rc = dist_recv_result_alloc(fd,
                                     state,
@@ -2692,8 +2603,6 @@ static int dist_coordinator_eval_remote_on_fd(
                                     &payload_bytes,
                                     err,
                                     errlen);
-        fprintf(stderr, "ds4: DEBUG eval_remote_on_fd recv_done req=%llu rc=%d kind=%u\n",
-                (unsigned long long)request_id, rc, kind);
         const double recv_t1 = profile ? dist_now_sec() : 0.0;
         if (profile) {
             fprintf(stderr,
@@ -2771,8 +2680,6 @@ static int dist_coordinator_eval_span(
         float *logits,
         char *err,
         size_t errlen) {
-    fprintf(stderr, "ds4: DEBUG eval_span pos0=%u n_tokens=%u reset=%d\n",
-            pos0, n_tokens, reset_session ? 1 : 0);
     const bool profile = dist_decode_profile_enabled() && n_tokens == 1;
     const double span_t0 = profile ? dist_now_sec() : 0.0;
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
@@ -2795,11 +2702,6 @@ static int dist_coordinator_eval_span(
         return 1;
     }
     const uint64_t result_hash = dist_token_hash_update_span(prefix_hash, tokens, n_tokens);
-    fprintf(stderr, "ds4: DEBUG eval_span hash pos0=%u n_tokens=%u reset=%d prefix=0x%llx result=0x%llx plan_count=%u\n",
-            pos0, n_tokens, reset_session ? 1 : 0,
-            (unsigned long long)prefix_hash,
-            (unsigned long long)result_hash,
-            plan->count);
     const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
     float *hidden = NULL;
     if (plan->count != 0) {
@@ -2841,7 +2743,6 @@ static int dist_coordinator_eval_span(
                                           err,
                                           errlen);
     const double local_t1 = profile ? dist_now_sec() : 0.0;
-    const bool local_eval_failed = rc != 0;
     double remote_t0 = 0.0, remote_t1 = 0.0;
     if (rc == 0 && plan->count != 0) {
         remote_t0 = profile ? dist_now_sec() : 0.0;
@@ -2879,7 +2780,7 @@ static int dist_coordinator_eval_span(
                 rc);
     }
     free(hidden);
-    return local_eval_failed ? DS4_DIST_LOCAL_EVAL_ERROR : rc;
+    return rc;
 }
 
 /* =========================================================================
@@ -3632,26 +3533,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
         return 1;
     }
     const uint32_t span_end = span_start + n_tokens;
-    const uint32_t vocab_size = (uint32_t)ds4_engine_vocab_size(state->engine);
-    /* v3 root-cause fix: chunk boundaries must not split DeepSeek image token
-     * blocks — the attention bounds/mask encoder fails on a straddling block
-     * (the 0917/0925-family "attention batch encode failed").  Reuse the
-     * canonical chunker the single-machine path already uses
-     * (ds4_deepseek4_prefill_chunk, ds4_image.c); for prompts without image
-     * blocks it returns exactly the old fixed-size chunk. */
-    uint32_t chunk_count = 0;
-    for (uint32_t walk = span_start; walk < span_end; ) {
-        uint32_t len = 0;
-        if (!ds4_deepseek4_prefill_chunk(prompt->v, span_end, vocab_size,
-                                         walk, chunk_cap, &len) || len == 0) {
-            if (errlen) snprintf(err, errlen,
-                                 "malformed or oversized DeepSeek image token block at token %u",
-                                 walk);
-            return 1;
-        }
-        walk += len;
-        chunk_count++;
-    }
+    const uint32_t chunk_count = (total + chunk_cap - 1u) / chunk_cap;
     const uint64_t hc_values = ds4_engine_hidden_f32_values(state->engine);
     const uint64_t max_hidden_bytes64 = (uint64_t)chunk_cap * hc_values * sizeof(float);
     if (max_hidden_bytes64 > UINT32_MAX) {
@@ -3710,9 +3592,8 @@ static int dist_coordinator_prefill_prompt_pipelined(
     }
     uint64_t chunk_prefix_hash = dist_token_hash_prefix(prompt->v, span_start);
     for (uint32_t i = 0, hash_pos = span_start; i < chunk_count; i++) {
-        uint32_t chunk = 0;
-        (void)ds4_deepseek4_prefill_chunk(prompt->v, span_end, vocab_size,
-                                          hash_pos, chunk_cap, &chunk);
+        const uint32_t remaining = span_end - hash_pos;
+        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
         chunk_prefix_hash = dist_token_hash_update_span(chunk_prefix_hash,
                                                         prompt->v + hash_pos,
                                                         chunk);
@@ -3768,15 +3649,8 @@ static int dist_coordinator_prefill_prompt_pipelined(
             rc = 1;
             break;
         }
-        uint32_t chunk = 0;
-        if (!ds4_deepseek4_prefill_chunk(prompt->v, span_end, vocab_size,
-                                         pos, chunk_cap, &chunk) || chunk == 0) {
-            if (errlen) snprintf(err, errlen,
-                                 "malformed or oversized DeepSeek image token block at token %u",
-                                 pos);
-            rc = 1;
-            break;
-        }
+        const uint32_t remaining = span_end - pos;
+        const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
         const uint64_t hidden_bytes64 = (uint64_t)chunk * hc_values * sizeof(float);
         const uint32_t hidden_bytes = (uint32_t)hidden_bytes64;
         ds4_dist_prefill_send_slot *slot =
@@ -3806,10 +3680,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                                           errlen);
         const double local_t1 = dist_now_sec();
         local_eval_sec += local_t1 - local_t0;
-        if (rc != 0) {
-            rc = DS4_DIST_LOCAL_EVAL_ERROR;
-            break;
-        }
+        if (rc != 0) break;
 
         slot->pos = pos;
         slot->n_tokens = chunk;
@@ -3838,7 +3709,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
                              sender.err[0] ? sender.err : "distributed prefill sender failed");
         rc = 1;
     }
-    if (rc != 0 && rc != DS4_DIST_LOCAL_EVAL_ERROR) {
+    if (rc != 0) {
         shutdown(plan->entry[0].fd, SHUT_RDWR);
     }
     if (rc == 0) {
@@ -3878,7 +3749,7 @@ static int dist_coordinator_prefill_prompt_pipelined(
     pthread_mutex_destroy(&reader.progress_mu);
     if (rc != 0) {
         free(reader.final_payload);
-        return rc;
+        return 1;
     }
     const uint32_t logits_bytes =
         (uint32_t)((uint64_t)ds4_engine_vocab_size(state->engine) * sizeof(float));
@@ -3937,17 +3808,10 @@ static int dist_coordinator_prefill_prompt(
                                                         errlen);
     }
 
-    const uint32_t vocab_size = (uint32_t)ds4_engine_vocab_size(state->engine);
     uint32_t pos = 0;
     while (pos < prompt_len) {
-        uint32_t chunk = 0;
-        if (!ds4_deepseek4_prefill_chunk(prompt->v, prompt_len, vocab_size,
-                                         pos, chunk_cap, &chunk) || chunk == 0) {
-            if (errlen) snprintf(err, errlen,
-                                 "malformed or oversized DeepSeek image token block at token %u",
-                                 pos);
-            return 1;
-        }
+        uint32_t remaining = prompt_len - pos;
+        uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
         int eval_rc = dist_coordinator_eval_span(state, session, plan,
                                                  prompt->v + pos, chunk, pos,
                                                  session_id, (*request_id)++,
@@ -4052,16 +3916,6 @@ static int dist_run_coordinator_generation(
         fprintf(stderr,
                 "ds4: distributed prompt processing failed: %s\n",
                 err);
-        if (prefill_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-            fprintf(stderr,
-                    "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                    err);
-            free(logits);
-            ds4_tokens_free(&prompt);
-            ds4_session_free(session);
-            dist_route_plan_free(&plan);
-            return 1;
-        }
         if (dist_coordinator_rebuild_from_transcript(state,
                                                      session,
                                                      &plan,
@@ -4109,17 +3963,6 @@ static int dist_run_coordinator_generation(
             fprintf(stderr,
                     "ds4: distributed replay prompt processing failed: %s\n",
                     err);
-            if (replay_prefill_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-                fprintf(stderr,
-                        "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                        err);
-                free(before);
-                free(logits);
-                ds4_tokens_free(&prompt);
-                ds4_session_free(session);
-                dist_route_plan_free(&plan);
-                return 1;
-            }
             if (dist_coordinator_rebuild_from_transcript(state,
                                                          session,
                                                          &plan,
@@ -4214,17 +4057,6 @@ static int dist_run_coordinator_generation(
                                                    false, logits, err, sizeof(err));
         if (decode_rc != 0) {
             fprintf(stderr, "\nds4: distributed decode failed: %s\n", err);
-            if (decode_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-                fprintf(stderr,
-                        "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                        err);
-                ds4_tokens_free(&transcript);
-                free(logits);
-                ds4_tokens_free(&prompt);
-                ds4_session_free(session);
-                dist_route_plan_free(&plan);
-                return 1;
-            }
             if (dist_coordinator_rebuild_from_transcript(state,
                                                          session,
                                                          &plan,
@@ -5104,8 +4936,6 @@ static int dist_save_remote_shard_to_file(
     if (payload_bytes_out) *payload_bytes_out = 0;
     uint64_t request_id = d->snapshot_request_id++;
     int fd = dist_connect_endpoint(entry->host, (int)entry->port, err, errlen);
-    fprintf(stderr, "ds4: DEBUG dist_save_remote_shard connected %s:%u fd=%d layers=%u:%un", entry->host, (unsigned)entry->port, fd, entry->layer_start, entry->layer_end);
-    fflush(stderr);
     if (fd < 0) return 1;
 
     ds4_dist_snapshot_req_fixed req;
@@ -5461,16 +5291,8 @@ int ds4_dist_session_load_payload(
             free(n_index_comp);
             return 1;
         }
-        /* fork: payloads of multimodal snapshots carry synthetic image tokens
-         * (vocab + DS4_DEEPSEEK4_IMAGE_*); accept them when the engine loaded
-         * the matching vision sidecar (same rule as the WORK frame check). */
-        const uint32_t vsz = (uint32_t)ds4_engine_vocab_size(d->state.engine);
-        const bool vision_synthetic =
-            tok >= vsz &&
-            tok <= vsz + (uint32_t)DS4_DEEPSEEK4_IMAGE_END &&
-            ds4_engine_has_vision(d->state.engine);
         if (tok > (uint32_t)INT_MAX ||
-            (tok >= vsz && !vision_synthetic)) {
+            tok >= (uint32_t)ds4_engine_vocab_size(d->state.engine)) {
             free(tokens);
             free(logits);
             free(n_comp);
@@ -5706,17 +5528,6 @@ int ds4_dist_session_sync(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
-    {
-        const ds4_tokens *live = owner ? ds4_session_tokens(owner) : NULL;
-        int live_len = live ? live->len : -1;
-        int session_pos = owner ? ds4_session_pos(owner) : -1;
-        fprintf(stderr, "ds4: DEBUG dist_session_sync prompt=%d live_tokens=%d session_pos=%d ckpt_param=%d\n",
-                prompt->len,
-                live_len,
-                session_pos,
-                (checkpoint && checkpoint->len >= 0) ? checkpoint->len : -1);
-    }
-
     if (checkpoint &&
         checkpoint->len >= 0 &&
         checkpoint->len <= prompt->len &&
@@ -5730,11 +5541,6 @@ int ds4_dist_session_sync(
         }
         const uint32_t pos0 = (uint32_t)checkpoint->len;
         const uint32_t suffix = (uint32_t)prompt->len - pos0;
-        fprintf(stderr, "ds4: DEBUG dist_session_sync ckpt_cont pos0=%u suffix=%u chunk_cap=%u plan_count=%u plan_fd=%d plan_gen=%llun",
-                pos0, suffix, chunk_cap,
-                d->plan.count,
-                d->plan.count > 0 ? d->plan.entry[0].fd : -1,
-                (unsigned long long)d->plan_generation);
         if (dist_coordinator_can_pipeline_prefill(&d->state, &d->plan, owner, suffix, chunk_cap)) {
             int prefill_rc = dist_coordinator_prefill_prompt_pipelined(&d->state,
                                                                        owner,
@@ -5750,14 +5556,6 @@ int ds4_dist_session_sync(
                                                                        err,
                                                                        errlen);
             if (prefill_rc != 0) {
-                if (prefill_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-                    fprintf(stderr,
-                            "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                            err);
-                    d->plan_ready = false;
-                    d->plan_generation = 0;
-                    return 1;
-                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5775,24 +5573,13 @@ int ds4_dist_session_sync(
                 }
                 d->plan_ready = true;
             }
-            ds4_session_update_checkpoint(owner, prompt);
             return 0;
         }
 
         uint32_t pos = pos0;
-        const uint32_t vocab_size = (uint32_t)ds4_engine_vocab_size(d->state.engine);
         while (pos < (uint32_t)prompt->len) {
-            uint32_t chunk = 0;
-            if (!ds4_deepseek4_prefill_chunk(prompt->v, (uint32_t)prompt->len,
-                                             vocab_size, pos, chunk_cap,
-                                             &chunk) || chunk == 0) {
-                if (errlen) snprintf(err, errlen,
-                                     "malformed or oversized DeepSeek image token block at token %u",
-                                     pos);
-                d->plan_ready = false;
-                d->plan_generation = 0;
-                return 1;
-            }
+            const uint32_t remaining = (uint32_t)prompt->len - pos;
+            const uint32_t chunk = remaining < chunk_cap ? remaining : chunk_cap;
             int eval_rc = dist_coordinator_eval_span(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5806,14 +5593,6 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
             if (eval_rc != 0) {
-                if (eval_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-                    fprintf(stderr,
-                            "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                            err);
-                    d->plan_ready = false;
-                    d->plan_generation = 0;
-                    return 1;
-                }
                 if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                              owner,
                                                              &d->plan,
@@ -5830,13 +5609,11 @@ int ds4_dist_session_sync(
                     return 1;
                 }
                 d->plan_ready = true;
-                ds4_session_update_checkpoint(owner, prompt);
                 return 0;
             }
             pos += chunk;
             dist_report_prefill_progress(owner, pos, (uint32_t)prompt->len);
         }
-        ds4_session_update_checkpoint(owner, prompt);
         return 0;
     }
 
@@ -5850,14 +5627,6 @@ int ds4_dist_session_sync(
                                                      err,
                                                      errlen);
     if (prefill_rc != 0) {
-        if (prefill_rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-            fprintf(stderr,
-                    "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                    err);
-            d->plan_ready = false;
-            d->plan_generation = 0;
-            return 1;
-        }
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5875,7 +5644,6 @@ int ds4_dist_session_sync(
         }
         d->plan_ready = true;
     }
-    ds4_session_update_checkpoint(owner, prompt);
     return 0;
 }
 
@@ -5906,14 +5674,6 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
-        if (rc == DS4_DIST_LOCAL_EVAL_ERROR) {
-            fprintf(stderr,
-                    "ds4: distributed coordinator: local eval failed; keeping route, skipping replay: %s\n",
-                    err);
-            d->plan_ready = false;
-            d->plan_generation = 0;
-            return 1;
-        }
         ds4_tokens transcript = {0};
         ds4_tokens_copy(&transcript, checkpoint);
         ds4_tokens_push(&transcript, token);
@@ -6223,8 +5983,6 @@ static int dist_send_snapshot_file_chunks(int fd, uint64_t request_id, FILE *fp,
         const uint32_t n = bytes > DS4_DIST_SNAPSHOT_CHUNK_BYTES ?
             DS4_DIST_SNAPSHOT_CHUNK_BYTES : (uint32_t)bytes;
         if (fread(buf, 1, n, fp) != n) {
-            fprintf(stderr, "ds4: DEBUG snapshot chunk fread short got=%d want=%d errno=%d\n",
-                    (int)ftell(fp) % (int)1, (int)n, errno);
             rc = -1;
             break;
         }
@@ -6237,7 +5995,6 @@ static int dist_send_snapshot_file_chunks(int fd, uint64_t request_id, FILE *fp,
         if (dist_write_frame_header(fd, DS4_DIST_MSG_SNAPSHOT_CHUNK, frame_bytes) != 0 ||
             dist_write_full(fd, &wire, sizeof(wire)) != 0 ||
             dist_write_full(fd, buf, n) != 0) {
-            fprintf(stderr, "ds4: DEBUG snapshot chunk write failed errno=%d\n", errno);
             rc = -1;
             break;
         }
@@ -7228,7 +6985,6 @@ static int dist_worker_handle_snapshot_load(
         ds4_dist_worker_state *state,
         ds4_dist_worker_upstream *upstream,
         uint32_t bytes) {
-    fprintf(stderr, "ds4: DEBUG worker snapshot_load entry bytes=%u\n", bytes);
     ds4_dist_snapshot_begin_fixed begin;
     uint64_t request_id = 0;
     uint64_t session_id = 0;
@@ -7283,15 +7039,8 @@ static int dist_worker_handle_snapshot_load(
             return rc == 0 ? 0 : -1;
         }
         uint32_t token = ntohl(wire_token);
-        /* fork: multimodal snapshot payloads carry synthetic image tokens;
-         * accept them when the engine has the matching vision sidecar. */
-        const uint32_t vsz = (uint32_t)ds4_engine_vocab_size(state->engine);
-        const bool vision_synthetic =
-            token >= vsz &&
-            token <= vsz + (uint32_t)DS4_DEEPSEEK4_IMAGE_END &&
-            ds4_engine_has_vision(state->engine);
         if (token > (uint32_t)INT_MAX ||
-            (token >= vsz && !vision_synthetic)) {
+            token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
             snprintf(err, sizeof(err), "snapshot token id is outside the model vocabulary");
             tokens[i] = 0;
         } else {
@@ -7446,14 +7195,6 @@ static int dist_worker_process_work_payload(
                                                            work.result_hash_lo);
     const bool profile = dist_decode_profile_enabled() && work.n_tokens == 1;
     const double total_t0 = profile ? dist_now_sec() : 0.0;
-    fprintf(stderr, "ds4: DEBUG worker got WORK req=%llu layers=%u:%u tokens=%u pos=%u flags=0x%x reset=%d\n",
-            (unsigned long long)request_id,
-            work.layer_start,
-            work.layer_end,
-            work.n_tokens,
-            work.pos0,
-            work.flags,
-            (work.flags & 0x04) ? 1 : 0);
     DIST_DEBUG("worker work request=%llu layers=%u:%u tokens=%u pos=%u flags=0x%x token_bytes=%u input_hc=%u/%ub route_count=%u route_index=%u route_bytes=%u",
                (unsigned long long)request_id,
                work.layer_start,
@@ -7531,18 +7272,7 @@ static int dist_worker_process_work_payload(
             return -1;
         }
         uint32_t token = ntohl(wire_token);
-        /* Vision prompts carry synthetic image token ids just above the vocab
-         * (vocab_size + DS4_DEEPSEEK4_IMAGE_*).  Accept them only when this
-         * engine actually loaded the matching vision sidecar: the worker needs
-         * the ids for the per-layer visual router bias. */
-        const uint32_t vocab_size =
-            (uint32_t)ds4_engine_vocab_size(state->engine);
-        const bool vision_synthetic =
-            token >= vocab_size &&
-            token <= vocab_size + (uint32_t)DS4_DEEPSEEK4_IMAGE_END &&
-            ds4_engine_has_vision(state->engine);
-        if (token > (uint32_t)INT_MAX ||
-            (token >= vocab_size && !vision_synthetic)) {
+        if (token > (uint32_t)INT_MAX || token >= (uint32_t)ds4_engine_vocab_size(state->engine)) {
             free(tokens);
             return dist_worker_upstream_send_work_error(upstream, request_id, "WORK token id is outside the model vocabulary");
         }
@@ -7759,13 +7489,6 @@ static int dist_worker_process_work_payload(
         session->token_hash = dist_token_hash_prefix(timeline->v, (uint32_t)timeline->len);
         session->token_hash_valid = true;
     }
-    fprintf(stderr, "ds4: DEBUG worker hash check req=%llu pos=%u tokens=%u worker_hash=0x%llx work_prefix_hash=0x%llx has_next=%d has_output=%dn",
-            (unsigned long long)request_id,
-            work.pos0, work.n_tokens,
-            (unsigned long long)session->token_hash,
-            (unsigned long long)work_prefix_hash,
-            has_next ? 1 : 0,
-            local_output_logits ? 1 : 0);
     if (session->token_hash != work_prefix_hash) {
         pthread_mutex_unlock(&state->mu);
         if (!input_hc_uses_wire) free(input_hc);
@@ -7840,12 +7563,6 @@ static int dist_worker_process_work_payload(
 
     const double send_t0 = profile ? dist_now_sec() : 0.0;
     int send_rc;
-    fprintf(stderr, "ds4: DEBUG worker send_decision req=%llu has_next=%d result_kind=%u route_count=%u route_index=%u\n",
-            (unsigned long long)request_id,
-            has_next ? 1 : 0,
-            result_kind,
-            work.route_count,
-            work.route_index);
     if (has_next) {
         send_rc = dist_forward_work_to_next(upstream,
                                             &next_route,
@@ -8174,31 +7891,17 @@ static void *dist_worker_data_client_main(void *arg) {
 
 static void *dist_worker_data_listener_main(void *arg) {
     ds4_dist_worker_state *state = arg;
-    int nfds = state->n_listen_fds;
-    if (nfds <= 0) return NULL;
-
-    /* 使用第一个 fd（IPv4 socket），因为 macOS  Thunderbolt 桥上
-     * IPv6 dual-stack socket 的 accept() 可能无法正确处理远程 IPv4 连接。
-     * 使用阻塞 accept() 避免 macOS 上 poll()/select() 的兼容性问题。 */
-    int primary_fd = state->listen_fds[0];
-
+    int listen_fd = state->listen_fd;
     for (;;) {
         struct sockaddr_storage ss;
         socklen_t slen = sizeof(ss);
-        int fd = accept(primary_fd, (struct sockaddr *)&ss, &slen);
+        int fd = accept(listen_fd, (struct sockaddr *)&ss, &slen);
         if (fd < 0) {
             if (errno == EINTR) continue;
-            fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n",
-                    strerror(errno));
+            fprintf(stderr, "ds4: distributed worker: data accept failed: %s\n", strerror(errno));
             continue;
         }
         dist_set_socket_low_latency(fd);
-        char accept_addr[NI_MAXHOST + NI_MAXSERV + 8];
-        dist_sockaddr_string((struct sockaddr *)&ss, slen,
-                             accept_addr, sizeof(accept_addr));
-        fprintf(stderr, "ds4: DEBUG worker data accept fd=%d peer=%s\n",
-                fd, accept_addr);
-        fflush(stderr);
 
         ds4_dist_data_client_ctx *ctx = calloc(1, sizeof(*ctx));
         if (!ctx) {
@@ -8225,7 +7928,6 @@ static void *dist_worker_data_listener_main(void *arg) {
         }
         pthread_detach(tid);
     }
-
     return NULL;
 }
 
@@ -8241,21 +7943,15 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     char err[256];
     const char *listen_host = opt->listen_host;
     int requested_port = opt->listen_port > 0 ? opt->listen_port : 0;
-
-    /* 使用修复版的双栈监听器 */
-    int listen_fds[DS4_DIST_MAX_LISTEN_FDS];
-    int n_listen = dist_open_listener_all(listen_host, requested_port,
-                                           listen_fds, DS4_DIST_MAX_LISTEN_FDS,
-                                           err, sizeof(err));
-    if (n_listen <= 0) {
-        fprintf(stderr, "ds4: distributed worker: %s\n",
-                err[0] ? err : "no listen sockets");
+    int listen_fd = dist_open_listener(listen_host, requested_port, err, sizeof(err));
+    if (listen_fd < 0) {
+        fprintf(stderr, "ds4: distributed worker: %s\n", err);
         return 1;
     }
-    int listen_port_i = dist_listener_port(listen_fds[0]);
+    int listen_port_i = dist_listener_port(listen_fd);
     if (listen_port_i <= 0) {
         fprintf(stderr, "ds4: distributed worker: could not determine data listener port\n");
-        for (int i = 0; i < n_listen; i++) close(listen_fds[i]);
+        close(listen_fd);
         return 1;
     }
     const uint32_t listen_port = (uint32_t)listen_port_i;
@@ -8268,15 +7964,13 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
     state.layer_end = dist_resolved_layer_end(opt, (uint32_t)ds4_engine_layer_count(engine));
     state.has_output = opt->layers.has_output;
     state.ctx_size = ctx_size;
-    for (int i = 0; i < n_listen && i < DS4_DIST_MAX_LISTEN_FDS; i++)
-        state.listen_fds[i] = listen_fds[i];
-    state.n_listen_fds = n_listen;
+    state.listen_fd = listen_fd;
     pthread_mutex_init(&state.mu, NULL);
 
     pthread_t data_tid;
     if (pthread_create(&data_tid, NULL, dist_worker_data_listener_main, &state) != 0) {
         fprintf(stderr, "ds4: distributed worker: pthread_create failed for data listener\n");
-        for (int i = 0; i < n_listen; i++) close(listen_fds[i]);
+        close(listen_fd);
         return 1;
     }
     pthread_detach(data_tid);
